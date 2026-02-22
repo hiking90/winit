@@ -137,6 +137,22 @@ pub struct ViewState {
 
     /// The state of the `Option` as `Alt`.
     option_as_alt: Cell<OptionAsAlt>,
+
+    /// Tracks text committed by the IME via `insertText` but not actually
+    /// inserted into the view's text storage (e.g., dropped because
+    /// `ime_state == Disabled`). Stores the actual text content so
+    /// `attributedSubstringForProposedRange:` can return it, and so
+    /// `markedRange`/`selectedRange` can report consistent positions.
+    /// This is critical for Korean IME where the first consonant after
+    /// input source switch is committed via `insertText` while IME is disabled.
+    ime_phantom_text: RefCell<String>,
+
+    /// True while `interpretKeyEvents` is executing. Used to distinguish
+    /// `insertText` calls originating from a user key press (inside
+    /// interpretKeyEvents) vs. IME finalization calls during input source
+    /// switch (outside interpretKeyEvents). The latter can produce duplicate
+    /// text for Korean IME vowels.
+    interpreting_key_events: Cell<bool>,
 }
 
 define_class!(
@@ -248,7 +264,8 @@ define_class!(
             trace_scope!("markedRange");
             let length = self.ivars().marked_text.borrow().length();
             if length > 0 {
-                NSRange::new(0, length)
+                let phantom_len = self.ivars().ime_phantom_text.borrow().encode_utf16().count();
+                NSRange::new(phantom_len, length)
             } else {
                 // Documented to return `{NSNotFound, 0}` if there is no marked range.
                 NSRange::new(NSNotFound as NSUInteger, 0)
@@ -258,8 +275,17 @@ define_class!(
         #[unsafe(method(selectedRange))]
         fn selected_range(&self) -> NSRange {
             trace_scope!("selectedRange");
-            // Documented to return `{NSNotFound, 0}` if there is no selection.
-            NSRange::new(NSNotFound as NSUInteger, 0)
+            // Return a valid cursor position instead of NSNotFound.
+            // Korean IME requires a valid selectedRange to properly process
+            // subsequent keystrokes during composition. Returning NSNotFound
+            // causes the IME to re-send the current marked text without change.
+            let phantom_len = self.ivars().ime_phantom_text.borrow().encode_utf16().count();
+            if self.hasMarkedText() {
+                let len = self.ivars().marked_text.borrow().length();
+                NSRange::new(phantom_len + len, 0)
+            } else {
+                NSRange::new(phantom_len, 0)
+            }
         }
 
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
@@ -320,6 +346,8 @@ define_class!(
         fn unmark_text(&self) {
             trace_scope!("unmarkText");
             *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+            // Reset phantom text tracking — composition session is ending
+            self.ivars().ime_phantom_text.borrow_mut().clear();
 
             let input_context = self.inputContext().expect("input context");
             input_context.discardMarkedText();
@@ -346,6 +374,9 @@ define_class!(
             _actual_range: *mut NSRange,
         ) -> Option<Retained<NSAttributedString>> {
             trace_scope!("attributedSubstringForProposedRange:actualRange:");
+            // Return None — we don't expose phantom text content to the IME.
+            // This forces the Korean IME to use composition mode (setMarkedText)
+            // instead of direct insertion mode (insertText with recombination).
             None
         }
 
@@ -375,10 +406,8 @@ define_class!(
         }
 
         #[unsafe(method(insertText:replacementRange:))]
-        fn insert_text(&self, string: &NSObject, _replacement_range: NSRange) {
-            // TODO: Use _replacement_range, requires changing the event to report surrounding text.
+        fn insert_text(&self, string: &NSObject, replacement_range: NSRange) {
             trace_scope!("insertText:replacementRange:");
-
             let string = if let Some(string) = string.downcast_ref::<NSAttributedString>() {
                 string.string().to_string()
             } else if let Some(string) = string.downcast_ref::<NSString>() {
@@ -388,14 +417,63 @@ define_class!(
                 panic!("unexpected text {string:?}")
             };
 
+            let repl_loc = replacement_range.location;
+            let repl_len = replacement_range.length;
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
 
-            // Commit only if we have marked text.
             if self.hasMarkedText() && self.is_ime_enabled() && !is_control {
+                // Normal commit path: IME is finalizing composition (has marked text).
+                self.ivars().ime_phantom_text.borrow_mut().clear();
+                self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                self.ivars().ime_state.set(ImeState::Committed);
+            } else if !is_control && self.ivars().ime_capabilities.get().is_some() && !string.is_ascii() {
+                // CJK IME committed text outside the normal flow (e.g., Korean IME
+                // first consonant after input source switch, or subsequent characters
+                // in direct-insertion mode). Forward as Ime::Commit so the app
+                // receives the text, and track phantom text for IME position consistency.
+
+                // Guard: only process if called from within interpretKeyEvents.
+                // When the Korean IME deactivates (input source switch), it may call
+                // insertText to "finalize" its internal buffer, re-sending the last
+                // vowel. This happens OUTSIDE interpretKeyEvents and would duplicate
+                // text that was already committed.
+                if !self.ivars().interpreting_key_events.get() {
+                    return;
+                }
+
+                // Handle replacement_range: if the IME wants to replace previously
+                // committed phantom text (e.g., Korean IME replacing "ㅎ" with "하"),
+                // update phantom text and tell the app to replace via Commit.
+                let has_replacement = repl_loc != NSNotFound as usize;
+                if has_replacement {
+                    let mut phantom = self.ivars().ime_phantom_text.borrow_mut();
+                    let utf16: Vec<u16> = phantom.encode_utf16().collect();
+                    let start = repl_loc;
+                    let end = (start + repl_len).min(utf16.len());
+                    if start <= utf16.len() {
+                        let before = String::from_utf16_lossy(&utf16[..start]);
+                        let after = String::from_utf16_lossy(&utf16[end..]);
+                        *phantom = format!("{before}{string}{after}");
+                    } else {
+                        phantom.push_str(&string);
+                    }
+                } else {
+                    self.ivars().ime_phantom_text.borrow_mut().push_str(&string);
+                }
+
+                // Transition from Disabled to Enabled if needed.
+                if self.ivars().ime_state.get() == ImeState::Disabled {
+                    self.queue_event(WindowEvent::Ime(Ime::Enabled));
+                }
+
+                // Forward the committed text to the app.
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 self.ivars().ime_state.set(ImeState::Committed);
             }
+            // ASCII text with no marked text: do nothing here.
+            // It will be handled by the KeyboardInput event sent from key_down.
         }
 
         // Basically, we're sent this message whenever a keyboard event that doesn't generate a
@@ -466,7 +544,9 @@ define_class!(
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_capabilities.get().is_some() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
+                self.ivars().interpreting_key_events.set(true);
                 self.interpretKeyEvents(&events_for_nsview);
+                self.ivars().interpreting_key_events.set(false);
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -810,6 +890,8 @@ impl WinitView {
             marked_text: Default::default(),
             accepts_first_mouse,
             option_as_alt: Cell::new(option_as_alt),
+            ime_phantom_text: RefCell::new(String::new()),
+            interpreting_key_events: Cell::new(false),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -877,8 +959,9 @@ impl WinitView {
             return;
         }
 
-        // Clear markedText
+        // Clear markedText and phantom text
         *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
+        self.ivars().ime_phantom_text.borrow_mut().clear();
 
         if self.ivars().ime_state.get() != ImeState::Disabled {
             self.ivars().ime_state.set(ImeState::Disabled);
