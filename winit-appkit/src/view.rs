@@ -109,6 +109,7 @@ fn get_left_modifier_code(key: &Key) -> KeyCode {
     }
 }
 
+// ── ViewState ────────────────────────────────────────────────────────────────
 #[derive(Debug)]
 pub struct ViewState {
     /// Strong reference to the global application state.
@@ -137,6 +138,20 @@ pub struct ViewState {
 
     /// The state of the `Option` as `Alt`.
     option_as_alt: Cell<OptionAsAlt>,
+
+    /// Text surrounding the caret, provided by the application via
+    /// `ImeRequest::Update` with `surrounding_text`.  The IME reads it
+    /// back via `attributedSubstringForProposedRange:` and uses the
+    /// cursor position for `selectedRange`.
+    /// (text_content, cursor_byte_position)
+    ime_surrounding_text: RefCell<(String, usize)>,
+
+    /// True while `interpretKeyEvents` is executing. Used to distinguish
+    /// `insertText` calls originating from a user key press (inside
+    /// interpretKeyEvents) vs. IME finalization calls during input source
+    /// switch (outside interpretKeyEvents). The latter can produce duplicate
+    /// text for Korean IME vowels.
+    interpreting_key_events: Cell<bool>,
 }
 
 define_class!(
@@ -240,7 +255,8 @@ define_class!(
         #[unsafe(method(hasMarkedText))]
         fn has_marked_text(&self) -> bool {
             trace_scope!("hasMarkedText");
-            self.ivars().marked_text.borrow().length() > 0
+            let result = self.ivars().marked_text.borrow().length() > 0;
+            result
         }
 
         #[unsafe(method(markedRange))]
@@ -248,7 +264,9 @@ define_class!(
             trace_scope!("markedRange");
             let length = self.ivars().marked_text.borrow().length();
             if length > 0 {
-                NSRange::new(0, length)
+                let (text, cursor_byte) = &*self.ivars().ime_surrounding_text.borrow();
+                let cursor_utf16 = text[..*cursor_byte].encode_utf16().count();
+                NSRange::new(cursor_utf16, length)
             } else {
                 // Documented to return `{NSNotFound, 0}` if there is no marked range.
                 NSRange::new(NSNotFound as NSUInteger, 0)
@@ -258,8 +276,17 @@ define_class!(
         #[unsafe(method(selectedRange))]
         fn selected_range(&self) -> NSRange {
             trace_scope!("selectedRange");
-            // Documented to return `{NSNotFound, 0}` if there is no selection.
-            NSRange::new(NSNotFound as NSUInteger, 0)
+            // Return a valid cursor position based on surrounding text.
+            // Korean IME requires a valid selectedRange to properly process
+            // subsequent keystrokes during composition.
+            let (text, cursor_byte) = &*self.ivars().ime_surrounding_text.borrow();
+            let cursor_utf16 = text[..*cursor_byte].encode_utf16().count();
+            if self.hasMarkedText() {
+                let len = self.ivars().marked_text.borrow().length();
+                NSRange::new(cursor_utf16 + len, 0)
+            } else {
+                NSRange::new(cursor_utf16, 0)
+            }
         }
 
         #[unsafe(method(setMarkedText:selectedRange:replacementRange:))]
@@ -267,11 +294,9 @@ define_class!(
             &self,
             string: &NSObject,
             selected_range: NSRange,
-            _replacement_range: NSRange,
+            replacement_range: NSRange,
         ) {
-            // TODO: Use _replacement_range, requires changing the event to report surrounding text.
             trace_scope!("setMarkedText:selectedRange:replacementRange:");
-
             let (marked_text, string) = if let Some(string) =
                 string.downcast_ref::<NSAttributedString>()
             {
@@ -282,6 +307,62 @@ define_class!(
                 // This method is guaranteed to get either a `NSString` or a `NSAttributedString`.
                 panic!("unexpected text {string:?}")
             };
+
+            // Handle replacement_range: when a valid range is given and the app
+            // supports surrounding text, delete the specified range from the
+            // committed (surrounding) text.  Korean IME uses this for compound
+            // jongseong: it replaces a committed syllable (e.g. "안") with new
+            // marked text (e.g. "않").
+            let repl_loc = replacement_range.location;
+            if repl_loc != NSNotFound as usize
+                && replacement_range.length > 0
+                && self
+                    .ivars()
+                    .ime_capabilities
+                    .get()
+                    .is_some_and(|c| c.surrounding_text())
+                && !self.hasMarkedText()
+            {
+                // No existing marked text → replacement_range refers directly to
+                // surrounding-text UTF-16 positions.
+                let (before_bytes, after_bytes) = {
+                    let surrounding = self.ivars().ime_surrounding_text.borrow();
+                    let (ref text, cursor_byte) = *surrounding;
+                    let utf16: Vec<u16> = text.encode_utf16().collect();
+
+                    let repl_start = repl_loc.min(utf16.len());
+                    let repl_end = (repl_loc + replacement_range.length).min(utf16.len());
+
+                    let before_text = String::from_utf16_lossy(&utf16[..repl_start]);
+                    let replaced_text =
+                        String::from_utf16_lossy(&utf16[repl_start..repl_end]);
+
+                    let start_byte = before_text.len();
+                    let end_byte = start_byte + replaced_text.len();
+
+                    let before_bytes = cursor_byte.saturating_sub(start_byte);
+                    let after_bytes = end_byte.saturating_sub(cursor_byte);
+
+                    (before_bytes, after_bytes)
+                };
+
+                if before_bytes > 0 || after_bytes > 0 {
+                    // Update internal surrounding text
+                    {
+                        let mut surrounding = self.ivars().ime_surrounding_text.borrow_mut();
+                        let cursor_byte = surrounding.1;
+                        let start = cursor_byte.saturating_sub(before_bytes);
+                        let end = (cursor_byte + after_bytes).min(surrounding.0.len());
+                        surrounding.0.replace_range(start..end, "");
+                        surrounding.1 = start;
+                    }
+
+                    self.queue_event(WindowEvent::Ime(Ime::DeleteSurrounding {
+                        before_bytes,
+                        after_bytes,
+                    }));
+                }
+            }
 
             // Update marked text.
             *self.ivars().marked_text.borrow_mut() = marked_text;
@@ -326,7 +407,6 @@ define_class!(
 
             self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
             if self.is_ime_enabled() {
-                // Leave the Preedit self.ivars()
                 self.ivars().ime_state.set(ImeState::Ground);
             } else {
                 tracing::warn!("Expected to have IME enabled when receiving unmarkText");
@@ -342,11 +422,44 @@ define_class!(
         #[unsafe(method_id(attributedSubstringForProposedRange:actualRange:))]
         fn attributed_substring_for_proposed_range(
             &self,
-            _range: NSRange,
-            _actual_range: *mut NSRange,
+            range: NSRange,
+            actual_range: *mut NSRange,
         ) -> Option<Retained<NSAttributedString>> {
             trace_scope!("attributedSubstringForProposedRange:actualRange:");
-            None
+
+            // Build "virtual text" = surrounding_before + marked_text + surrounding_after.
+            // The IME sees text in this layout (matching markedRange/selectedRange),
+            // so we must return substrings from the same virtual text.  Without
+            // including the marked text, the Korean IME cannot read back its own
+            // composition for compound-jongseong merging (e.g., 안+ㅎ→않).
+            let virtual_text = {
+                let surrounding = self.ivars().ime_surrounding_text.borrow();
+                let (ref text, cursor_byte) = *surrounding;
+                let marked_str = self.ivars().marked_text.borrow().string().to_string();
+                format!("{}{}{}", &text[..cursor_byte], marked_str, &text[cursor_byte..])
+            };
+
+            let result = if !virtual_text.is_empty() {
+                let utf16: Vec<u16> = virtual_text.encode_utf16().collect();
+                let start = range.location.min(utf16.len());
+                let end = (range.location + range.length).min(utf16.len());
+
+                if start < end {
+                    let substring = String::from_utf16_lossy(&utf16[start..end]);
+
+                    if !actual_range.is_null() {
+                        unsafe { *actual_range = NSRange::new(start, end - start) };
+                    }
+
+                    let ns_string = NSString::from_str(&substring);
+                    Some(NSAttributedString::from_nsstring(&ns_string))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            result
         }
 
         #[unsafe(method(characterIndexForPoint:))]
@@ -375,38 +488,117 @@ define_class!(
         }
 
         #[unsafe(method(insertText:replacementRange:))]
-        fn insert_text(&self, string: &NSObject, _replacement_range: NSRange) {
-            // TODO: Use _replacement_range, requires changing the event to report surrounding text.
+        fn insert_text(&self, string: &NSObject, replacement_range: NSRange) {
             trace_scope!("insertText:replacementRange:");
-
             let string = if let Some(string) = string.downcast_ref::<NSAttributedString>() {
                 string.string().to_string()
             } else if let Some(string) = string.downcast_ref::<NSString>() {
                 string.to_string()
             } else {
-                // This method is guaranteed to get either a `NSString` or a `NSAttributedString`.
                 panic!("unexpected text {string:?}")
             };
 
+            let repl_loc = replacement_range.location;
+            let repl_len = replacement_range.length;
             let is_control = string.chars().next().is_some_and(|c| c.is_control());
+            let has_replacement = repl_loc != NSNotFound as usize && repl_len > 0;
 
-            // Commit only if we have marked text.
-            if self.hasMarkedText() && self.is_ime_enabled() && !is_control {
-                // Clear marked text as required by the NSTextInputClient protocol.
-                // This prevents subsequent insertText calls (e.g., for a trailing
-                // space) from incorrectly seeing stale marked text.
+            // Suppress out-of-band insertText during input source switch when
+            // IME is already disabled.
+            if self.ivars().ime_state.get() == ImeState::Disabled
+                && !is_control
+                && !string.is_ascii()
+                && !self.ivars().interpreting_key_events.get()
+            {
+                return;
+            }
+
+            if has_replacement
+                && self.ivars().ime_capabilities.get().is_some_and(|c| c.surrounding_text())
+            {
+                // CJK direct-insertion mode: Korean IME uses insertText with
+                // replacement_range to compose syllables. Convert to
+                // DeleteSurrounding + Commit so the app handles the replacement.
+                if !self.ivars().interpreting_key_events.get() {
+                    return;
+                }
+
+                let (before_bytes, after_bytes, new_text, new_cursor) = {
+                    let surrounding = self.ivars().ime_surrounding_text.borrow();
+                    let (text, cursor_byte) = (&surrounding.0, surrounding.1);
+                    let utf16: Vec<u16> = text.encode_utf16().collect();
+
+                    let repl_start = repl_loc.min(utf16.len());
+                    let repl_end = (repl_loc + repl_len).min(utf16.len());
+
+                    // Convert UTF-16 range to byte positions
+                    let before_text = String::from_utf16_lossy(&utf16[..repl_start]);
+                    let replaced_text = String::from_utf16_lossy(&utf16[repl_start..repl_end]);
+                    let after_text = String::from_utf16_lossy(&utf16[repl_end..]);
+
+                    // Calculate DeleteSurrounding bytes relative to cursor
+                    let start_byte = before_text.len();
+                    let end_byte = start_byte + replaced_text.len();
+                    let before_bytes = cursor_byte.saturating_sub(start_byte);
+                    let after_bytes = end_byte.saturating_sub(cursor_byte);
+
+                    let new_text = format!("{before_text}{string}{after_text}");
+                    let new_cursor = before_text.len() + string.len();
+                    (before_bytes, after_bytes, new_text, new_cursor)
+                };
+                // Update internal surrounding text for next IME query
+                *self.ivars().ime_surrounding_text.borrow_mut() = (new_text, new_cursor);
+
+                // Emit events
+                self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+                if before_bytes > 0 || after_bytes > 0 {
+                    self.queue_event(WindowEvent::Ime(Ime::DeleteSurrounding {
+                        before_bytes,
+                        after_bytes,
+                    }));
+                }
+                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                self.ivars().ime_state.set(ImeState::Committed);
+            } else if self.hasMarkedText() && self.is_ime_enabled() && !is_control {
+                // Normal commit path: IME is finalizing composition (has marked text).
                 *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
-
                 self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
                 self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
                 self.ivars().ime_state.set(ImeState::Committed);
             } else if self.ivars().ime_state.get() == ImeState::Committed && !is_control {
-                // After committing composed text (e.g., Korean "한"), the IME may
-                // send a second insertText for the triggering character (e.g.,
-                // space). Forward it to the app as a regular key event instead of
-                // committing it again through IME, which would cause double input.
+                // Post-commit trailing character: forward as regular key input.
                 self.ivars().forward_key_to_app.set(true);
+            } else if self.ivars().interpreting_key_events.get() && !is_control && !string.is_ascii()
+            {
+                // Non-ASCII character during interpretKeyEvents with no marked text
+                // and no replacement range.  This happens for the first Korean
+                // character after input source switch (Disabled state, no composition
+                // yet).  Commit directly so the character is not lost.
+                if self
+                    .ivars()
+                    .ime_capabilities
+                    .get()
+                    .is_some_and(|c| c.surrounding_text())
+                {
+                    let (new_text, new_cursor) = {
+                        let surrounding = self.ivars().ime_surrounding_text.borrow();
+                        let (ref text, cursor_byte) = *surrounding;
+                        let new_text = format!(
+                            "{}{}{}",
+                            &text[..cursor_byte],
+                            string,
+                            &text[cursor_byte..]
+                        );
+                        let new_cursor = cursor_byte + string.len();
+                        (new_text, new_cursor)
+                    };
+                    *self.ivars().ime_surrounding_text.borrow_mut() = (new_text, new_cursor);
+                }
+                self.queue_event(WindowEvent::Ime(Ime::Preedit(String::new(), None)));
+                self.queue_event(WindowEvent::Ime(Ime::Commit(string)));
+                self.ivars().ime_state.set(ImeState::Committed);
             }
+            // ASCII text with no marked text: handled by KeyboardInput from key_down.
         }
 
         // Basically, we're sent this message whenever a keyboard event that doesn't generate a
@@ -415,10 +607,21 @@ define_class!(
         fn do_command_by_selector(&self, command: Sel) {
             trace_scope!("doCommandBySelector:");
 
+            // Don't forward commands that arrive right after IME commit,
+            // EXCEPT deleteBackward: — Korean IME sends commit + deleteBackward
+            // when backspacing a single consonant preedit (e.g. "ㄱ").
+            // Without this exception, the delete is lost and the user must
+            // press backspace twice.
+            if self.ivars().ime_state.get() == ImeState::Committed {
+                let cmd_name = command.name().to_str().unwrap_or("");
+                if cmd_name != "deleteBackward:" {
+                    return;
+                }
+            }
+
             self.ivars().forward_key_to_app.set(true);
 
             if self.hasMarkedText() && self.ivars().ime_state.get() == ImeState::Preedit {
-                // Leave preedit so that we also report the key-up for this key.
                 self.ivars().ime_state.set(ImeState::Ground);
             }
 
@@ -448,11 +651,21 @@ define_class!(
             {
                 let mut prev_input_source = self.ivars().input_source.borrow_mut();
                 let current_input_source = self.current_input_source();
-                if *prev_input_source != current_input_source && self.is_ime_enabled() {
+                if *prev_input_source != current_input_source {
+                    // Always track the current input source, even when IME is
+                    // not yet enabled.  Without this, the stale prev value
+                    // causes a false "input source changed" on the NEXT key
+                    // after the app enables IME.
                     *prev_input_source = current_input_source;
                     drop(prev_input_source);
-                    self.ivars().ime_state.set(ImeState::Disabled);
-                    self.queue_event(WindowEvent::Ime(Ime::Disabled));
+
+                    if self.is_ime_enabled() {
+                        // Notify app that input source changed.  No text to
+                        // commit — the app already has the text via surrounding
+                        // text.
+                        self.ivars().ime_state.set(ImeState::Disabled);
+                        self.queue_event(WindowEvent::Ime(Ime::Disabled));
+                    }
                 }
             }
 
@@ -469,7 +682,9 @@ define_class!(
             // is not handled by IME and should be handled by the application)
             if self.ivars().ime_capabilities.get().is_some() {
                 let events_for_nsview = NSArray::from_slice(&[&*event]);
+                self.ivars().interpreting_key_events.set(true);
                 self.interpretKeyEvents(&events_for_nsview);
+                self.ivars().interpreting_key_events.set(false);
 
                 // If the text was committed we must treat the next keyboard event as IME related.
                 if self.ivars().ime_state.get() == ImeState::Committed {
@@ -813,6 +1028,8 @@ impl WinitView {
             marked_text: Default::default(),
             accepts_first_mouse,
             option_as_alt: Cell::new(option_as_alt),
+            ime_surrounding_text: RefCell::new((String::new(), 0)),
+            interpreting_key_events: Cell::new(false),
         });
         let this: Retained<Self> = unsafe { msg_send![super(this), init] };
 
@@ -880,7 +1097,7 @@ impl WinitView {
             return;
         }
 
-        // Clear markedText
+        // Clear markedText. No text to commit — the app has it via surrounding text.
         *self.ivars().marked_text.borrow_mut() = NSMutableAttributedString::new();
 
         if self.ivars().ime_state.get() != ImeState::Disabled {
@@ -898,6 +1115,10 @@ impl WinitView {
         self.ivars().ime_size.set(size);
         let input_context = self.inputContext().expect("input context");
         input_context.invalidateCharacterCoordinates();
+    }
+
+    pub(super) fn set_ime_surrounding_text(&self, text: String, cursor: usize) {
+        *self.ivars().ime_surrounding_text.borrow_mut() = (text, cursor);
     }
 
     /// Reset modifiers and emit a synthetic ModifiersChanged event if deemed necessary.

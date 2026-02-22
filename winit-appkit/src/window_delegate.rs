@@ -1715,6 +1715,16 @@ impl WindowDelegate {
             }
         }
 
+        if let Some(surrounding) = request_data.surrounding_text {
+            if self.view().ime_capabilities().is_some_and(|c| c.surrounding_text()) {
+                let cursor = surrounding.cursor();
+                let text = surrounding.into_text();
+                self.view().set_ime_surrounding_text(text, cursor);
+            } else {
+                warn!("discarding IME surrounding text update without capability enabled.");
+            }
+        }
+
         Ok(())
     }
 
